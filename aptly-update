@@ -1,0 +1,129 @@
+
+#!/usr/bin/env bash
+# 
+# A simplified wrapper for aptly to update mirrors & repos and re-publish respective snapshots
+#
+
+set -euo pipefail
+
+
+# http://mywiki.wooledge.org/BashFAQ/004
+shopt -s nullglob dotglob
+
+# Make files readable by others, specifically http server
+umask 022
+
+PROGNAME=$(basename $0)
+
+err() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] ($PROGNAME): ERROR: $@" >&2
+}
+
+status() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] ($PROGNAME): $@"
+}
+
+# Provide an option to override values via env variables
+: ${LOCK_FD:="200"}
+: ${LOCK_FILE:="/var/lock/${PROGNAME}.lock"}
+: ${APTLY_CMD:="aptly"}
+: ${TMPDIR:="/var/aptly/tmp"}
+
+mkdir -p "$TMPDIR"
+
+lock() {
+  eval "exec $LOCK_FD>$LOCK_FILE"
+  flock -n $LOCK_FD || ( err "Cannot aquire lock on ${LOCK_FILE}" ; exit 1; )
+}
+
+update_every() {
+  local type=$1
+
+  if ! [[ "$type" =~ repo|mirror ]]; then err "Update type has to be repo or mirror"; exit 3; fi
+  while read item; do
+    status "Updating $type $item"
+
+    if [[ "$type" == "mirror" ]]; then
+      aptly $type update $item
+    fi
+
+    # Heavily simplified
+
+    set +e
+    publish=$(aptly publish list | grep "${item}/"|awk '{print $2}')
+    set -e
+
+    if ! [[ -z "$publish" ]]; then
+      dist="${publish/*\/}"
+      status "Removing published $dist $item"
+      aptly publish drop $dist $item
+    fi
+
+    if aptly snapshot show $item > /dev/null 2>&1 ; then
+      status "Removing snapshot $item"
+      aptly snapshot drop $item && aptly snapshot create $item from $type $item
+    else
+      aptly snapshot create $item from $type $item
+    fi
+
+    # Move aside current, we could remove later to minimize repo downtime
+    if [[ -d "/var/aptly/public/${item}" ]]; then
+      TMPFILE=$(mktemp -d /var/aptly/public/${item}.XXXXXX)
+      mv "/var/aptly/public/${item}" "$TMPFILE" && rm -rf "$TMPFILE"
+    fi
+    aptly publish snapshot -batch -passphrase-file="/var/aptly/.gnupg/.gpgpass" $item $item
+
+  done < <(aptly --raw $type list)
+}
+
+cleanup() {
+  shopt -u nullglob dotglob
+  rm -f "$LOCK_FILE"
+}
+
+finish() {
+  local exit_status="${1:-$?}"
+  if [[ "$exit_status" -eq 0 ]]; then
+    status "DONE (exit code: ${exit_status})"
+  else
+    err "exit code: ${exit_status}"
+  fi
+  cleanup
+  exit $exit_status
+}
+
+usage() {
+  cat <<EOL
+
+      A simple aptly wrapper.
+      This script will update aptly mirrors & repos, snapshot and re-publish them.
+
+      USAGE:
+      $0 [ -u update ] [ -h help ]
+
+EOL
+exit 1
+}
+
+trap finish SIGHUP SIGINT SIGQUIT SIGTERM ERR
+
+if [ "$#" -lt 1 ]; then
+  usage
+fi
+
+while getopts ":u" opt; do
+  case "$opt" in
+    u)
+      lock
+      if [[ "$LOGNAME" != 'aptly' ]]; then err 'You must be aptly user to run that script'; exit 2; fi
+      status 'Update requested'
+      update_every mirror
+      update_every repo
+      shift
+    ;;
+    *)
+      usage
+    ;;
+  esac
+done
+finish
